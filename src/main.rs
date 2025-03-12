@@ -1,15 +1,23 @@
 use std::env;
 use std::fs;
 use std::sync::Mutex;
-use actix_web::{get, post, middleware::Logger, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, middleware::Logger, web, App, HttpResponse, HttpServer, Responder};
 use actix_cors::Cors;
 use serde::{Serialize, Deserialize};
 use env_logger::Env;
 use log::error;
-use thiserror::Error;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::{rand_core::OsRng, SaltString, PasswordHash};
 use std::io::Read;
+
+mod book;
+use book::{
+    Book,
+    get_book_by_id,
+    get_books,
+    get_book_with_query,
+    add_or_update_book,
+};
 
 fn hash_password(password: &str) -> String {
     let salt = SaltString::generate(&mut OsRng);
@@ -26,141 +34,12 @@ struct User {
     password: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct Book {
-    id: u32,
-    title: String,
-    content: String,
-    tags: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct BookQuery {
-    id: Option<u32>,
-    tag: Option<String>,
-}
-
 struct AppState {
     data_file: String,
 }
 
-#[derive(Debug, Error)]
-enum BookError {
-    #[error("Failed to read JSON file")]
-    FileReadError(#[from] std::io::Error),
-
-    #[error("Failed to parse JSON")]
-    JsonParseError(#[from] serde_json::Error),
-}
-
-impl actix_web::ResponseError for BookError {
-    fn error_response(&self) -> HttpResponse<actix_web::body::BoxBody> {
-        match self {
-            BookError::FileReadError(_) => HttpResponse::InternalServerError().body("Failed to read JSON"),
-            BookError::JsonParseError(_) => HttpResponse::InternalServerError().body("Failed to parse JSON"),
-        }
-    }
-}
-
-fn read_books_from_file(file_path: &str) -> Result<Vec<Book>, BookError> {
-    let contents = fs::read_to_string(file_path)?;
-
-    let books: Vec<Book> = serde_json::from_str(&contents)?;
-
-    Ok(books)
-}
-
-#[get("/")]
-async fn hello() -> impl Responder {
-    HttpResponse::Ok().body("Hello world!")
-}
-
-#[get("/books")]
-async fn get_books(data: web::Data<Mutex<AppState>>) -> Result<impl Responder, BookError> {
-    let file_path = {
-        let state = data.lock().unwrap();
-        state.data_file.clone()
-    };
-
-    let books = read_books_from_file(&file_path)?;
-    Ok(HttpResponse::Ok().json(books))
-}
-
-fn write_books_to_file(file_path: &str, books: &Vec<Book>) -> Result<(), BookError> {
-    let contents = serde_json::to_string_pretty(books)?;
-
-    fs::write(file_path, contents)?;
-
-    Ok(())
-}
-
-#[post("/books")]
-async fn add_or_update_book(data: web::Data<Mutex<AppState>>, new_book: web::Json<Book>) -> Result<impl Responder, BookError> {
-    let file_path = {
-        let state = data.lock().unwrap();
-        state.data_file.clone()
-    };
-
-    let mut books = read_books_from_file(&file_path)?;
-
-    let existing_book_pos = books.iter_mut().position(|b| b.id == new_book.id);
-
-    match existing_book_pos {
-        Some(pos) => {
-            books[pos] = new_book.into_inner();
-        }
-        None => {
-            books.push(new_book.into_inner());
-        }
-    }
-
-    // ファイルに保存
-    write_books_to_file(&file_path, &books)?;
-
-    Ok(HttpResponse::Ok().json(books))
-}
-
-#[get("/books/search")]
-async fn get_book_with_query(
-    data: web::Data<Mutex<AppState>>,
-    query: web::Query<BookQuery>,
-) -> Result<impl Responder, BookError> {
-    let file_path = {
-        let state = data.lock().unwrap();
-        state.data_file.clone()
-    };
-
-    let books = read_books_from_file(&file_path)?;
-
-    let filtered_books: Vec<Book> = books.into_iter()
-        .filter(|b| {
-            (query.id.map_or(true, |id| b.id == id as u32)) &&
-            (query.tag.as_deref().map_or(true, |tag| b.tags.contains(&tag.to_string())))
-        })
-        .collect();
-
-    Ok(HttpResponse::Ok().json(filtered_books))
-}
-
-#[get("/books/id/{id}")]
-async fn get_book_by_id(data: web::Data::<Mutex<AppState>>, id: web::Path<u32>) -> Result<impl Responder, BookError> {
-    let file_path = {
-        let state = data.lock().unwrap();
-        state.data_file.clone()
-    };
-    let id = id.into_inner();
-
-    let books = read_books_from_file(&file_path)?;
-
-    let filtered_book: Vec<Book> = books.into_iter()
-        .filter(|b| b.id == id)
-        .collect();
-
-    Ok(HttpResponse::Ok().json(filtered_book))
-}
-
 fn load_users() -> Vec<User> {
-    let mut file = match fs::File::open("users.json") {
+    let mut file = match fs::File::open("src/users/users.json") {
         Ok(file) => file,
         Err(_) => return Vec::new(),
     };
@@ -171,18 +50,33 @@ fn load_users() -> Vec<User> {
     serde_json::from_str(&contents).unwrap_or_else(|_| Vec::new())
 }
 
-fn save_user(username: &str, password: &str) {
+fn save_user(username: &str, password: &str) -> Result<(), String> {
     let hashed_password = hash_password(password);
+    let mut users = load_users();
+
+    // ユーザー名が既に存在するかチェック
+    if users.iter().any(|user| user.username == username) {
+        return Err(format!("Username '{}' is already taken.", username));
+    }
+
     let new_user = User {
         username: username.to_string(),
         password: hashed_password,
     };
 
-    let mut users = load_users();
     users.push(new_user);
 
     let json = serde_json::to_string_pretty(&users).unwrap();
     fs::write("src/users/users.json", json).expect("Failed to write file");
+
+    Ok(())
+}
+
+fn verify_password(stored_hash: &str, password: &str) -> bool {
+    let parsed_hash = PasswordHash::new(stored_hash).unwrap();
+    let argon2 = Argon2::default();
+
+    argon2.verify_password(password.as_bytes(), &parsed_hash).is_ok()
 }
 
 #[actix_web::main]
@@ -196,7 +90,9 @@ async fn main() -> std::io::Result<()> {
         data_file: file_path,
     }));
 
-    save_user("user1", "password");
+    let result = save_user("user2", "password");
+
+    println!("{:?}", result);
 
     HttpServer::new(move || {
         App::new()
@@ -223,7 +119,6 @@ async fn main() -> std::io::Result<()> {
                     .allow_any_header()
             )
             .wrap(Logger::default())
-            .service(hello)
             .service(get_books)
             .service(get_book_by_id)
             .service(get_book_with_query)
@@ -327,11 +222,14 @@ mod tests {
 
         assert!(body.contains("Rust Basics"));
     }
+
+    // ユーザー関係
+    #[actix_rt::test]
+    async  fn test_password_hashing_and_verification() {
+        let password = "password";
+        let hashed_password = hash_password(&password);
+
+        assert!(verify_password(&hashed_password, password));
+        assert!(!verify_password(&hashed_password, "wrong_password"));
+    }
 }
-
-// fn verify_password(stored_hash: &str, password: &str) -> bool {
-//     let parsed_hash = PasswordHash::new(stored_hash).unwrap();
-//     let argon2 = Argon2::default();
-
-//     argon2.verify_password(password.as_bytes(), &parsed_hash).is_ok()
-// }
